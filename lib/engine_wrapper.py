@@ -699,8 +699,14 @@ def first_move_time(game: model.Game) -> chess.engine.Limit:
     :param game: The game that the bot is playing.
     :return: The time to choose the first move.
     """
-    # Need to hardcode first movetime since Lichess has 30 sec limit.
-    search_time = seconds(10)
+    # Scale first move time by game speed
+    speed = getattr(game, "speed", "")
+    if speed == "bullet" or speed == "ultraBullet":
+        search_time = seconds(0.5)
+    elif speed == "blitz":
+        search_time = seconds(1.5)
+    else:
+        search_time = seconds(2.5)
     logger.info(f"Searching for time {sec_str(search_time)} seconds for game {game.id}")
     return chess.engine.Limit(time=to_seconds(search_time), clock_id="first move")
 
@@ -837,10 +843,12 @@ def get_chessdb_move(li: lichess.Lichess, board: chess.Board, game: model.Game,
                      chessdb_cfg: Configuration) -> tuple[str | None, chess.engine.InfoDict]:
     """Get a move from chessdb.cn's opening book."""
     use_chessdb = chessdb_cfg.enabled
-    time_left = msec(game.state[wbtime(board)])
+    side = wbtime(board)
+    time_left = msec(game.state[side]) if side in game.state else seconds(999999)
     min_time = seconds(chessdb_cfg.min_time)
     max_time = seconds(chessdb_cfg.max_time)
-    if not use_chessdb or time_left < min_time or game.clock_initial > max_time or board.uci_variant != "chess":
+    is_corr = getattr(game, "speed", "") in ["correspondence", "unlimited"]
+    if not use_chessdb or (not is_corr and (time_left < min_time or game.clock_initial > max_time)) or board.uci_variant != "chess":
         return None, {}
 
     move = None
@@ -875,11 +883,12 @@ def get_lichess_cloud_move(li: lichess.Lichess, board: chess.Board, game: model.
                            lichess_cloud_cfg: Configuration) -> tuple[str | None, chess.engine.InfoDict]:
     """Get a move from the lichess's cloud analysis."""
     side = wbtime(board)
-    time_left = msec(game.state[side])
+    time_left = msec(game.state[side]) if side in game.state else seconds(999999)
     min_time = seconds(lichess_cloud_cfg.min_time)
     max_time = seconds(lichess_cloud_cfg.max_time)
     use_lichess_cloud = lichess_cloud_cfg.enabled
-    if not use_lichess_cloud or time_left < min_time or game.clock_initial > max_time:
+    is_corr = getattr(game, "speed", "") in ["correspondence", "unlimited"]
+    if not use_lichess_cloud or (not is_corr and (time_left < min_time or game.clock_initial > max_time)):
         return None, {}
 
     move = None
@@ -928,12 +937,13 @@ def get_opening_explorer_move(li: lichess.Lichess, board: chess.Board, game: mod
                               ) -> tuple[str | None, chess.engine.InfoDict]:
     """Get a move from lichess's opening explorer."""
     side = wbtime(board)
-    time_left = msec(game.state[side])
+    time_left = msec(game.state[side]) if side in game.state else seconds(999999)
     min_time = seconds(opening_explorer_cfg.min_time)
     max_time = seconds(opening_explorer_cfg.max_time)
     source = opening_explorer_cfg.source
-    if (not opening_explorer_cfg.enabled or time_left < min_time or game.clock_initial > max_time or source == "master"
-            and board.uci_variant != "chess"):
+    is_corr = getattr(game, "speed", "") in ["correspondence", "unlimited"]
+    if (not opening_explorer_cfg.enabled or (not is_corr and (time_left < min_time or game.clock_initial > max_time)) or (source == "master"
+            and board.uci_variant != "chess")):
         return None, {}
 
     move = None
@@ -969,9 +979,18 @@ def get_opening_explorer_move(li: lichess.Lichess, board: chess.Board, game: mod
                 moves.append((winrate if opening_explorer_cfg.sort == "winrate" else games_played,
                               games_played if opening_explorer_cfg.sort == "winrate" else winrate, possible_move["uci"]))
         moves.sort(reverse=True)
-        move = moves[0][2]
-        logger.info(f"Got move {move} from lichess opening explorer ({opening_explorer_cfg.sort}: {moves[0][0]})"
-                    f" for game {game.id}")
+        if moves:
+            top_metric = moves[0][0]
+            threshold = top_metric - 0.03 if opening_explorer_cfg.sort == "winrate" else top_metric * 0.5
+            candidate_moves = [m for m in moves if m[0] >= threshold]
+            if candidate_moves:
+                weights = [max(1, (m[1] if opening_explorer_cfg.sort == "winrate" else m[0])) for m in candidate_moves]
+                selected = random.choices(candidate_moves, weights=weights, k=1)[0]
+                move = selected[2]
+            else:
+                move = moves[0][2]
+            logger.info(f"Got move {move} from lichess opening explorer ({opening_explorer_cfg.sort}: {moves[0][0]})"
+                        f" for game {game.id}")
 
     return move, comment
 
@@ -988,10 +1007,10 @@ def get_online_egtb_move(li: lichess.Lichess, board: chess.Board, game: model.Ga
     source = online_egtb_cfg.source
     minimum_time = seconds(online_egtb_cfg.min_time)
     maximum_time = seconds(online_egtb_cfg.max_time)
-    time_left = game.state[wbtime(board)]
+    time_left = game.state.get(wbtime(board), 0)
+    is_corr = getattr(game, "speed", "") in ["correspondence", "unlimited"]
     if (not use_online_egtb
-            or msec(time_left) < minimum_time
-            or game.clock_initial > maximum_time
+            or (not is_corr and (msec(time_left) < minimum_time or game.clock_initial > maximum_time))
             or board.uci_variant not in ["chess", "antichess", "atomic"]
             and source == "lichess"
             or board.uci_variant != "chess"
